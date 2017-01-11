@@ -7,6 +7,8 @@ from datetime import datetime
 import random
 import time
 import uuid
+import threading
+import os
 
 import redis
 
@@ -15,6 +17,9 @@ DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_DELAY = 200
 DEFAULT_TTL = 100000
 CLOCK_DRIFT_FACTOR = 0.01
+REFRESH_GRANULARITY_THREAD = 'thread'
+REFRESH_GRANULARITY_PROCESS = 'process'
+REFRESH_GRANULARITY_HOST = 'host'
 
 # Reference:  http://redis.io/topics/distlock
 # Section Correct implementation with a single instance
@@ -79,12 +84,16 @@ class RedLock(object):
                  retry_times=DEFAULT_RETRY_TIMES,
                  retry_delay=DEFAULT_RETRY_DELAY,
                  ttl=DEFAULT_TTL,
-                 created_by_factory=False):
+                 created_by_factory=False,
+                 refresh=False,
+                 refresh_granularity=None):
 
         self.resource = resource
         self.retry_times = retry_times
         self.retry_delay = retry_delay
         self.ttl = ttl
+        self.refresh = refresh
+        self.refresh_granularity = refresh_granularity
 
         if created_by_factory:
             self.factory = None
@@ -112,6 +121,9 @@ class RedLock(object):
             self.redis_nodes.append(node)
         self.quorum = len(self.redis_nodes) // 2 + 1
 
+        mac = uuid.UUID(int=uuid.getnode()).hex[-12:]
+        self.mac = ":".join([mac[e:e+2] for e in range(0, 11, 2)])
+
     def __enter__(self):
         acquired, validity = self.acquire_with_validity()
         if not acquired:
@@ -120,6 +132,17 @@ class RedLock(object):
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
+
+    def _get_lock_value(self):
+        if self.refresh and self.refresh_granularity is not None:
+            val = {
+                REFRESH_GRANULARITY_HOST: self.mac,
+                REFRESH_GRANULARITY_PROCESS: self.mac+'-'+str(os.getpid()),
+                REFRESH_GRANULARITY_THREAD: self.mac+'-'+str(os.getpid())+'-'+str(threading.current_thread().ident)
+            }[self.refresh_granularity]
+            return val
+        else:
+            return uuid.uuid4().hex
 
     def _total_ms(self, delta):
         """
@@ -134,9 +157,19 @@ class RedLock(object):
         acquire a single redis node
         """
         try:
-            return node.set(self.resource, self.lock_key, nx=True, px=self.ttl)
+            lock_value = self._get_lock_value()
+            tmp_locked = node.set(self.resource, lock_value, nx=True, px=self.ttl)
+            # compare , if the exist value equals lock_value then refresh the ttl
+            if not tmp_locked:  # None
+                val = node.get(self.resource)
+                if lock_value == val:
+                    # reset ttl
+                    node.pexpire(self.resource, self.ttl)
+                    return True
+            return tmp_locked
         except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
             return False
+
 
     def release_node(self, node):
         """
@@ -144,7 +177,7 @@ class RedLock(object):
         """
         # use the lua script to release the lock in a safe way
         try:
-            node._release_script(keys=[self.resource], args=[self.lock_key])
+            node._release_script(keys=[self.resource], args=[self._get_lock_value()])
         except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
             pass
 
@@ -156,9 +189,6 @@ class RedLock(object):
         return self._acquire()
 
     def _acquire(self):
-
-        # lock_key should be random and unique
-        self.lock_key = uuid.uuid4().hex
 
         for retry in range(self.retry_times + 1):
             acquired_node_count = 0
